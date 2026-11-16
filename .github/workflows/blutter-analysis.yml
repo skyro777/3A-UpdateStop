@@ -1,0 +1,128 @@
+name: Blutter Dart Analysis
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  blutter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      APK_PATH: "apk-repo/3A CLOUD GAMING UPDATE.apk"
+      EXPECTED_SHA256: "e06059bfd2238173f118ad1f54902ba45ef92031d5101b61b45d2486fb0955cb"
+
+    steps:
+      - name: Checkout APK repository with Git LFS
+        uses: actions/checkout@v4
+        with:
+          repository: skyro777/3A-UpdateStop
+          ref: main
+          path: apk-repo
+          lfs: true
+          persist-credentials: false
+
+      - name: Verify and extract native libs
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACTUAL_SHA256="$(sha256sum "$APK_PATH" | awk '{print $1}')"
+          if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+            echo "::error::APK checksum mismatch"
+            exit 1
+          fi
+          mkdir -p app-lib
+          unzip -j "$APK_PATH" 'lib/arm64-v8a/libapp.so' 'lib/arm64-v8a/libflutter.so' -d app-lib
+          ls -la app-lib
+
+      - name: Install blutter dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build build-essential pkg-config libicu-dev
+          python3 -m pip install --upgrade pip
+          python3 -m pip install requests
+
+      - name: Clone blutter
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/worawit/blutter.git blutter
+          cd blutter && git rev-parse HEAD
+
+      - name: Run blutter
+        shell: bash
+        run: |
+          set +e
+          python3 blutter/blutter.py app-lib blutter-out 2>&1 | tee blutter-run.log
+          BLUTTER_EXIT=${PIPESTATUS[0]}
+          set -e
+          echo "BLUTTER_EXIT=$BLUTTER_EXIT" > blutter-exit.txt
+          du -sh blutter-out || true
+          find blutter-out -maxdepth 2 -type f | head -50 || true
+          if [ "$BLUTTER_EXIT" -ne 0 ]; then
+            echo "::warning::blutter failed, see log artifact"
+          fi
+
+      - name: Build filtered analysis bundle
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p analysis
+          cp blutter-run.log analysis/ 2>/dev/null || true
+          cp blutter-exit.txt analysis/ 2>/dev/null || true
+
+          if [ -d blutter-out ]; then
+            # Core metadata files (always include)
+            for f in pp.txt objs.txt class_list.txt blutter_frida.js; do
+              [ -f "blutter-out/$f" ] && cp "blutter-out/$f" analysis/
+            done
+
+            # Full file listing with sizes
+            find blutter-out -type f -printf '%s\t%p\n' | sort -rn > analysis/file-listing.txt
+
+            # Copy every asm file that matches update/version keywords (by content or name)
+            mkdir -p analysis/matched-asm
+            MATCHES=0
+            while IFS= read -r -d '' F; do
+              if grep -lqiE 'version_manage|check_version|checkVersion|forceUpdate|force_update|UpgradeDialog|UpdateDialog|update_dialog|newVersion|new_version|appUpgrade|upgrade_dialog|抢先体验|发现新版本|立即更新|newpacket' "$F" 2>/dev/null; then
+                REL="${F#blutter-out/}"
+                mkdir -p "analysis/matched-asm/$(dirname "$REL")"
+                cp "$F" "analysis/matched-asm/$REL"
+                MATCHES=$((MATCHES+1))
+              fi
+            done < <(find blutter-out/asm -type f -name '*.S' -print0 2>/dev/null)
+            echo "Matched asm files: $MATCHES"
+
+            # Dump generous context around version_manage/get_info references into one searchable log
+            {
+              echo "===== grep -n version_manage (all matched-asm files) ====="
+              grep -rn -B5 -A80 'version_manage' analysis/matched-asm 2>/dev/null || true
+              echo
+              echo "===== grep -n check_version ====="
+              grep -rn -B5 -A80 'check_version\|checkVersion' analysis/matched-asm 2>/dev/null || true
+              echo
+              echo "===== grep -n force/upgrade keywords ====="
+              grep -rn -B5 -A40 -iE 'forceUpdate|force_update|UpgradeDialog|UpdateDialog|update_dialog|appUpgrade|upgrade_dialog' analysis/matched-asm 2>/dev/null || true
+              echo
+              echo "===== grep -n 160749 / 2.7.32 in pp.txt ====="
+              grep -n -B10 -A10 '160749\|2\.7\.32' blutter-out/pp.txt 2>/dev/null || true
+            } > analysis/version-logic-context.txt || true
+            wc -l analysis/version-logic-context.txt || true
+          fi
+
+          zip -qr blutter-analysis.zip analysis
+          unzip -tq blutter-analysis.zip > /dev/null
+          ls -lh blutter-analysis.zip
+
+      - name: Upload blutter analysis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blutter-dart-analysis
+          path: blutter-analysis.zip
+          retention-days: 14
+          if-no-files-found: error
