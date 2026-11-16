@@ -80,33 +80,62 @@ Fixes in v2 of the patcher (`scripts/patch_apk.py`):
 
 ## WeChat login
 
-The WeChat login flow itself is **not touched** by the patch (fluwx plugin,
-`com.sayx.sagame.wxapi.WXEntryActivity`, app id `wx6c9838146fd2cc29` — all
-byte-identical to the original). However there is one honest caveat:
+Verified on-device: the **微信登录 (WeChat SSO) button fails with errCode -6**
+（微信授权失败:-6 - "Incorrect signature. Check that the signature is the
+same as that on the open platform."). This is expected and unavoidable for
+**any** re-signed APK: the WeChat client (com.tencent.mm) reads the calling
+app's signing certificate through the system PackageManager and compares
+its MD5 against the certificate registered on WeChat Open Platform for
+app id `wx6c9838146fd2cc29` - which is 3ayx's own certificate
+(MD5 `32a5bf5af1294ad89bf1d8d25306c64e`, `CN=Lucers Tu, O=3ayx`).
+The original private key exists only at the developer (深圳麟可科技),
+so no re-signed build can pass this check, and no patch inside the 3A APK
+can influence a check performed in WeChat's own process.
 
-- The WeChat client (`com.tencent.mm`) verifies that the **calling APK's
-  signature** matches the certificate registered by the developer on WeChat
-  Open Platform for the app id. This build is necessarily re-signed (the
-  original key is not available), so WeChat login **may return errCode -1**
-  (“应用签名不一致”).
-- **Test it** — open the app → WeChat login. If WeChat opens and returns to
-  the app with a success toast, everything is fine.
-- If it fails: the check happens inside the WeChat app's process (it reads
-  the signature from the system `PackageManager`), so **no patch inside the
-  3A APK can influence it** — this is true for every re-signed APK of every
-  app, not just this one. Realistic options in that case:
-  1. **Root + signature-spoofing module** (cleanest): on a rooted device
-     (e.g. Magisk + LSPosed on your Android 10 OnePlus), a signature-spoof
-     module can make WeChat see the original 3A certificate
-     (SHA-1 `f5a5d7f20191310e6b268937bf88847b9c674525`) for
-     `com.sayx.sagame`. The original certificate is available in this
-     repository's original APK, so the exact value to spoof is known.
-  2. **Bind a phone number to the account first** (in the *original* app,
-     before switching to the patched build), then use phone-number login on
-     the patched build — same account, same games, same data.
-- WeChat **Pay** inside the app has the same signature dependency and the
-  same caveat. In-app top-ups that go through the server-side order flow
-  (pay URLs from `OrderForWxChatDetailInfo`) are affected the same way.
+### Solution: 扫码登录 (WeChat scan-to-login) - works on this build
+
+The app ships a second WeChat login channel that does **not** use the
+signature-checked SSO. On the login screen, tap **扫码登录** - the scan
+button in the bottom options row (next to 一键登录 and 微信登录).
+
+The app then shows a WeChat QR code ("使用微信扫一扫登录APP", status
+"待授权"). This is WeChat's DiffDevOAuth scan-login: pure HTTPS against
+open.weixin.qq.com plus your own WeChat doing the authorization - the
+WeChat client never checks the calling APK's signature in this flow.
+
+Authorize it with the WeChat that owns your 3A account:
+
+- **Same phone:** WeChat -> 扫一扫 -> tap the 相册 (album) icon -> pick a
+  screenshot of the QR -> confirm. (Alternative: send the screenshot to
+  文件传输助手, open the image, long-press -> 识别二维码.)
+- **Second device:** WeChat -> 扫一扫 -> scan the QR on the screen -> confirm.
+
+The status flips from 待授权 to authorized and the app logs into the
+**same WeChat account** - same games, VIP and saves. The received authCode
+is POSTed to the very same `login_by_wx` endpoint the SSO flow uses.
+If the QR expires (a few minutes), tap 扫码登录 again for a fresh one.
+
+### Recommended: also bind your phone number
+
+After logging in (scan login or any other way): 我的 / user center ->
+**账号绑定** -> 绑定手机/微信账号 -> bind your phone via SMS code. From
+then on, log in with 手机号 + 验证码 (the login form's default) - the
+simplest permanent option. 一键登录 (carrier one-key) also unlocks with a
+Chinese SIM.
+
+Alternatives that reach the same account: the official H5 client
+`https://play.3ayx.net` (same backend, WeChat web-login + phone binding),
+or the official latest APK from the 3A site / app stores as a one-time
+"binding vehicle" (its WeChat SSO works because it is genuinely signed).
+
+### WeChat Pay
+
+The direct WeChat-pay button in the recharge flow has the same signature
+dependency. Use the 扫码支付 (QR payment) option instead - display-a-QR
+flows are signature-free for the same reason as scan-login.
+
+Full analysis and step-by-step guide:
+[docs/wechat-login-solution.md](docs/wechat-login-solution.md)
 
 ### How the update flow works (analysis findings)
 
