@@ -1,0 +1,180 @@
+name: Patch and Release APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      APK_PATH: "apk-repo/3A CLOUD GAMING UPDATE.apk"
+      EXPECTED_SHA256: "e06059bfd2238173f118ad1f54902ba45ef92031d5101b61b45d2486fb0955cb"
+      KEYSTORE: "ci/3amod.keystore"
+      KS_PASS: "3AUpdateStop!2025"
+      KS_ALIAS: "3amod"
+      OUT_APK: "3A-CLOUD-GAMING-2.7.32-NOUPDATE.apk"
+
+    steps:
+      - name: Checkout repository (sources) with Git LFS
+        uses: actions/checkout@v4
+        with:
+          repository: skyro777/3A-UpdateStop
+          ref: main
+          path: apk-repo
+          lfs: true
+          persist-credentials: true
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Verify original APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACTUAL_SHA256="$(sha256sum "$APK_PATH" | awk '{print $1}')"
+          echo "Original APK SHA-256: $ACTUAL_SHA256"
+          if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+            echo "::error::APK checksum mismatch - aborting"
+            exit 1
+          fi
+
+      - name: Download Android build tools (apksigner / zipalign / aapt)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 -o bt.zip "https://dl.google.com/android/repository/build-tools_r34-linux.zip"
+          unzip -q bt.zip -d bt
+          BT_DIR="$(find bt -maxdepth 1 -mindepth 1 -type d | head -1)"
+          echo "BT_DIR=$BT_DIR" >> "$GITHUB_ENV"
+          chmod +x "$BT_DIR/apksigner" "$BT_DIR/zipalign" "$BT_DIR/aapt"
+
+      - name: Run patcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 apk-repo/scripts/patch_apk.py "$APK_PATH" patched-unsigned.apk
+
+      - name: Sign patched APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$BT_DIR/apksigner" sign \
+            --ks "$KEYSTORE" \
+            --ks-pass "pass:$KS_PASS" \
+            --ks-key-alias "$KS_ALIAS" \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --out "$OUT_APK" \
+            patched-unsigned.apk
+
+      - name: Verify signature, version and alignment
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$BT_DIR/apksigner" verify --verbose "$OUT_APK" | tee apksigner-verify.txt
+          "$BT_DIR/zipalign" -c -p 4 "$OUT_APK"
+          echo "zipalign: OK"
+          "$BT_DIR/aapt" dump badging "$OUT_APK" | head -2 | tee badging.txt
+          grep -q "versionCode='999999999'" badging.txt
+          grep -q "versionName='9.9.99'" badging.txt
+          echo "version assertions: OK"
+
+      - name: Byte-level diff report vs original
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 apk-repo/scripts/apk_diff_report.py "$APK_PATH" patched-unsigned.apk | tee diff-report.txt
+          if ! grep -q "changed_entries=3" diff-report.txt; then
+            echo "::error::unexpected number of changed entries"
+            exit 1
+          fi
+
+      - name: Compute checksums
+        shell: bash
+        run: |
+          sha256sum "$OUT_APK" | tee release-sha256.txt
+          ls -la "$OUT_APK"
+
+      - name: Upload patched APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-apk
+          path: |
+            ${{ env.OUT_APK }}
+            release-sha256.txt
+            apksigner-verify.txt
+            diff-report.txt
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Write release notes
+        shell: bash
+        run: |
+          cat > release-notes.md <<'EOF'
+          # 3A Cloud Gaming 2.7.32 — Update-Stop Edition
+
+          Patched build of **3A云游 (com.sayx.sagame) 2.7.32 (160749)** with the
+          force-update popup removed and update checking permanently disabled.
+
+          ## What is patched
+
+          | File | Change | Purpose |
+          |---|---|---|
+          | AndroidManifest.xml | versionName `2.7.32` → `9.9.99`, versionCode `160749` → `999999999` | The app now reports itself as far newer than any published release, so every "server version > local version" check is false |
+          | lib/arm64-v8a/libapp.so | Dart constants `160749` → `999999`, `2.7.32` → `9.9.99`; `version_manage/get_info` URL broken | Same as above for hardcoded Dart version constants; the version-check API call is disabled outright |
+          | classes8.dex | Hot-patch polling URL `version_manage/get_hotfix_info` disabled; BuildConfig version string aligned | Prevents the server-side hot-patch engine from silently replacing the patched libapp.so on launch |
+
+          Every other byte of the original APK (all 6,952 ZIP entries) is untouched.
+          The popup after login ("发现新版本 V2.7.36 / 抢先体验") will no longer appear.
+
+          ## IMPORTANT before installing
+
+          1. **Uninstall the original app first.** This build is signed with a new key
+             (the original signing key is not available), so Android will refuse to
+             install it over the existing app. Uninstalling also clears the old
+             hot-patch cache, which is desirable here.
+          2. **WeChat login may no longer work.** The WeChat client verifies the app
+             signature registered by the developer, and a re-signed APK usually fails
+             with errCode -1. If you rely on WeChat login: **bind a mobile number to
+             your account in the original app BEFORE uninstalling**, then log in with
+             phone number + SMS code on this build (same account, same games/data).
+          3. Allow installs from unknown sources when prompted.
+
+          ## Verification
+
+          - `apksigner verify`: v2 + v3 pass
+          - `zipalign -c -p 4`: pass (all 49 native libs remain 16 KiB page-aligned)
+          - `aapt badging`: `package: name='com.sayx.sagame' versionCode='999999999' versionName='9.9.99'`
+          - SHA-256 of the released APK is published alongside this release.
+
+          Reproducible: the exact patcher (`scripts/patch_apk.py`) and signing keystore
+          live in this repository; the "Patch and Release APK" workflow rebuilds this
+          APK from the original LFS-stored binary.
+          EOF
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="v2.7.32-noupdate"
+          if gh release view "$TAG" -R skyro777/3A-UpdateStop > /dev/null 2>&1; then
+            echo "Release $TAG already exists - deleting and recreating"
+            gh release delete "$TAG" -R skyro777/3A-UpdateStop --yes
+            git -C apk-repo push origin ":refs/tags/$TAG" || true
+          fi
+          gh release create "$TAG" \
+            -R skyro777/3A-UpdateStop \
+            --title "3A Cloud Gaming 2.7.32 - No-Update Edition" \
+            --notes-file release-notes.md \
+            "$OUT_APK" \
+            release-sha256.txt
