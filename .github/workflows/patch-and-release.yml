@@ -93,6 +93,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          DEXDUMP="$(pwd)/$BT_DIR/dexdump"
+          test -x "$DEXDUMP"
           mkdir -p dexcheck
           cd dexcheck
           unzip -q -j "../patched-unsigned.apk" 'classes*.dex'
@@ -101,7 +103,7 @@ jobs:
           # Every DEX must parse cleanly or the release is aborted.
           for f in classes*.dex; do
             echo "dexdump: $f"
-            "$BT_DIR/dexdump" -l plain "$f" > /dev/null
+            "$DEXDUMP" -l plain "$f" > /dev/null
           done
           echo "dexdump: all DEX files verified"
 
