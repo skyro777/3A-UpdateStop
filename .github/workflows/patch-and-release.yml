@@ -13,11 +13,13 @@ jobs:
 
     env:
       APK_PATH: "apk-repo/3A CLOUD GAMING UPDATE.apk"
-      EXPECTED_SHA256: "e06059bfd2238173f118ad1f54902ba45ef92031d5101b61b45d2486fb0955cb"
+      EXPECTED_SHA256: "e06059bfd2238173f118f1f54902ba45ef92031d5101b61b45d2486fb0955cb"
       KEYSTORE: "apk-repo/ci/3amod.keystore"
       KS_PASS: "3AUpdateStop!2025"
       KS_ALIAS: "3amod"
       OUT_APK: "3A-CLOUD-GAMING-2.7.32-NOUPDATE.apk"
+      OLD_TAG: "v2.7.32-noupdate"
+      NEW_TAG: "v2.7.32-noupdate.2"
 
     steps:
       - name: Checkout repository (sources) with Git LFS
@@ -46,7 +48,7 @@ jobs:
             exit 1
           fi
 
-      - name: Download Android build tools (apksigner / zipalign / aapt)
+      - name: Download Android build tools (apksigner / zipalign / aapt / dexdump)
         shell: bash
         run: |
           set -euo pipefail
@@ -54,9 +56,9 @@ jobs:
           unzip -q bt.zip -d bt
           BT_DIR="$(find bt -maxdepth 1 -mindepth 1 -type d | head -1)"
           echo "BT_DIR=$BT_DIR" >> "$GITHUB_ENV"
-          chmod +x "$BT_DIR/apksigner" "$BT_DIR/zipalign" "$BT_DIR/aapt"
+          chmod +x "$BT_DIR/apksigner" "$BT_DIR/zipalign" "$BT_DIR/aapt" "$BT_DIR/dexdump"
 
-      - name: Run patcher
+      - name: Run patcher (v2 - minimal, sort-safe, no version spoofing)
         shell: bash
         run: |
           set -euo pipefail
@@ -83,17 +85,39 @@ jobs:
           "$BT_DIR/zipalign" -c -p 4 "$OUT_APK"
           echo "zipalign: OK"
           "$BT_DIR/aapt" dump badging "$OUT_APK" | head -2 | tee badging.txt
-          grep -q "versionCode='999999999'" badging.txt
-          grep -q "versionName='9.9.99'" badging.txt
-          echo "version assertions: OK"
+          grep -q "versionCode='160749'" badging.txt
+          grep -q "versionName='2.7.32'" badging.txt
+          echo "version assertions OK (original values kept - no spoofing)"
+
+      - name: Verify every DEX with dexdump (same verifier as on-device)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dexcheck
+          cd dexcheck
+          unzip -q -j "../patched-unsigned.apk" 'classes*.dex'
+          # dexdump uses ART's libdexfile verifier - the same code path that
+          # rejected classes8.dex on Android 10 ("Out-of-order string_ids").
+          # Every DEX must parse cleanly or the release is aborted.
+          for f in classes*.dex; do
+            echo "dexdump: $f"
+            "$BT_DIR/dexdump" -l plain "$f" > /dev/null
+          done
+          echo "dexdump: all DEX files verified"
 
       - name: Byte-level diff report vs original
         shell: bash
         run: |
           set -euo pipefail
           python3 apk-repo/scripts/apk_diff_report.py "$APK_PATH" patched-unsigned.apk | tee diff-report.txt
-          if ! grep -q "changed_entries=3" diff-report.txt; then
-            echo "::error::unexpected number of changed entries"
+          if ! grep -q "changed_entries=2" diff-report.txt; then
+            echo "::error::unexpected number of changed entries (expected exactly 2: libapp.so + classes8.dex)"
+            exit 1
+          fi
+          grep -q "changed: lib/arm64-v8a/libapp.so" diff-report.txt
+          grep -q "changed: classes8.dex" diff-report.txt
+          if grep -q "changed: AndroidManifest.xml" diff-report.txt; then
+            echo "::error::AndroidManifest.xml must be untouched"
             exit 1
           fi
 
@@ -119,62 +143,97 @@ jobs:
         shell: bash
         run: |
           cat > release-notes.md <<'EOF'
-          # 3A Cloud Gaming 2.7.32 — Update-Stop Edition
+          # 3A Cloud Gaming 2.7.32 - Update-Stop Edition (rev 2, crash fixed)
 
-          Patched build of **3A云游 (com.sayx.sagame) 2.7.32 (160749)** with the
-          force-update popup removed and update checking permanently disabled.
+          ## What was fixed vs the first release
 
-          ## What is patched
+          The first build (`v2.7.32-noupdate`) crashed on launch (black screen
+          2-3 s, then crash) with:
+
+          ```
+          java.lang.ClassNotFoundException: Didn't find class "com.sayx.sagame.CloudGame"
+          Zip open failed: Failure to verify dex file '...classes8.dex':
+          Out-of-order string_ids: '9.9.99' then '200'
+          ```
+
+          Cause: that build rewrote the BuildConfig version string
+          `2.7.32` -> `9.9.99` inside `classes8.dex`. DEX string tables must
+          stay sorted by UTF-16 code point order; `9` sorts after `2`, so
+          Android's verifier rejected the whole `classes8.dex` and the
+          Application class could not be loaded.
+
+          This build:
+          - no longer touches that string at all (it is unused by any code)
+          - no longer spoofs versionName/versionCode anywhere: the manifest
+            keeps `2.7.32 (160749)`, so the app reports its real version to
+            3A's servers exactly like the genuine build (safest for login)
+          - every DEX patch is proven sort-safe before it is applied, and all
+            59,838 string-table entries are re-validated after patching
+          - `dexdump` (the same verifier Android uses on-device) must accept
+            every DEX file before this release is published
+
+          ## What is patched (2 ZIP entries out of 6,952)
 
           | File | Change | Purpose |
           |---|---|---|
-          | AndroidManifest.xml | versionName `2.7.32` → `9.9.99`, versionCode `160749` → `999999999` | The app now reports itself as far newer than any published release, so every "server version > local version" check is false |
-          | lib/arm64-v8a/libapp.so | Dart constants `160749` → `999999`, `2.7.32` → `9.9.99`; `version_manage/get_info` URL broken | Same as above for hardcoded Dart version constants; the version-check API call is disabled outright |
-          | classes8.dex | Hot-patch polling URL `version_manage/get_hotfix_info` disabled; BuildConfig version string aligned | Prevents the server-side hot-patch engine from silently replacing the patched libapp.so on launch |
+          | `lib/arm64-v8a/libapp.so` | `version_manage/get_info` -> `version_manage/get_inf0` | Breaks the only data source of the post-login update popup ("发现新版本 V2.7.36 / 抢先体验"). The request now fails exactly like the offline case, so the UpgradeDialog is never triggered |
+          | `classes8.dex` | `version_manage/get_hotfix_info` -> `...get_hotfix_inf0` | Disables the native hot-patch engine that could bsdiff-replace the patched libapp.so from the server on every launch |
 
-          Every other byte of the original APK (all 6,952 ZIP entries) is untouched.
-          The popup after login ("发现新版本 V2.7.36 / 抢先体验") will no longer appear.
+          Everything else is byte-identical to the original APK, including
+          `AndroidManifest.xml` (versionName 2.7.32, versionCode 160749),
+          all 49 native libraries (16 KiB page-aligned,
+          `extractNativeLibs=false` preserved), all resources and all other
+          DEX files.
 
           ## IMPORTANT before installing
 
-          1. **Uninstall the original app first.** This build is signed with a new key
-             (the original signing key is not available), so Android will refuse to
-             install it over the existing app. Uninstalling also clears the old
-             hot-patch cache, which is desirable here.
-          2. **WeChat login may no longer work.** The WeChat client verifies the app
-             signature registered by the developer, and a re-signed APK usually fails
-             with errCode -1. If you rely on WeChat login: **bind a mobile number to
-             your account in the original app BEFORE uninstalling**, then log in with
-             phone number + SMS code on this build (same account, same games/data).
+          1. **Uninstall the crashing build first.** This release keeps the
+             original versionCode (160749); the broken previous build carried
+             999999999, so Android refuses an in-place downgrade anyway. A
+             clean install also clears any stale hot-patch cache.
+          2. **WeChat login:** the WeChat client verifies the APK signature
+             registered for the app id (`wx6c9838146fd2cc29`) on WeChat Open
+             Platform. This build is re-signed (the original key is not
+             available), so WeChat login may fail with errCode -1. **Please
+             test and report the result** - if it fails, see the repository
+             README (WeChat login section) for the follow-up options.
           3. Allow installs from unknown sources when prompted.
 
           ## Verification
 
-          - `apksigner verify`: v2 + v3 pass
+          - `apksigner verify`: v1 + v2 pass
           - `zipalign -c -p 4`: pass (all 49 native libs remain 16 KiB page-aligned)
-          - `aapt badging`: `package: name='com.sayx.sagame' versionCode='999999999' versionName='9.9.99'`
+          - `dexdump`: all 10 DEX files parse cleanly, all string tables
+            verified sorted (the exact check Android 10 failed on before)
+          - `aapt badging`: `versionCode='160749' versionName='2.7.32'`
+            (original values - no spoofing)
           - SHA-256 of the released APK is published alongside this release.
 
-          Reproducible: the exact patcher (`scripts/patch_apk.py`) and signing keystore
-          live in this repository; the "Patch and Release APK" workflow rebuilds this
-          APK from the original LFS-stored binary.
+          Reproducible: the exact patcher (`scripts/patch_apk.py`) and signing
+          keystore live in this repository; this workflow rebuilds the APK
+          from the original LFS-stored binary.
           EOF
 
-      - name: Create GitHub release
+      - name: Replace broken release, publish new one
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="v2.7.32-noupdate"
-          if gh release view "$TAG" -R skyro777/3A-UpdateStop > /dev/null 2>&1; then
-            echo "Release $TAG already exists - deleting and recreating"
-            gh release delete "$TAG" -R skyro777/3A-UpdateStop --yes
-            git -C apk-repo push origin ":refs/tags/$TAG" || true
+          # remove the broken first release so nobody installs the crashing APK
+          if gh release view "$OLD_TAG" -R skyro777/3A-UpdateStop > /dev/null 2>&1; then
+            echo "deleting broken release $OLD_TAG"
+            gh release delete "$OLD_TAG" -R skyro777/3A-UpdateStop --yes
+            git -C apk-repo push origin ":refs/tags/$OLD_TAG" || true
           fi
-          gh release create "$TAG" \
+          if gh release view "$NEW_TAG" -R skyro777/3A-UpdateStop > /dev/null 2>&1; then
+            echo "recreating release $NEW_TAG"
+            gh release delete "$NEW_TAG" -R skyro777/3A-UpdateStop --yes
+            git -C apk-repo push origin ":refs/tags/$NEW_TAG" || true
+          fi
+          gh release create "$NEW_TAG" \
             -R skyro777/3A-UpdateStop \
-            --title "3A Cloud Gaming 2.7.32 - No-Update Edition" \
+            --title "3A Cloud Gaming 2.7.32 - No-Update Edition (rev 2, crash fixed)" \
             --notes-file release-notes.md \
             "$OUT_APK" \
             release-sha256.txt
