@@ -1,0 +1,347 @@
+name: 3A Cloud Gaming - Full Decompile
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  decompile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      APK_PATH: "apk-repo/3A CLOUD GAMING UPDATE.apk"
+      OUTPUT_DIR: "decompile-output"
+      EXPECTED_SHA256: "e06059bfd2238173f118ad1f54902ba45ef92031d5101b61b45d2486fb0955cb"
+      JADX_VERSION: "1.5.6"
+      APKTOOL_VERSION: "3.0.3"
+
+    steps:
+      - name: Show runner specifications
+        shell: bash
+        run: |
+          echo "========== RUNNER SPECS =========="
+          echo "CPU cores : $(nproc)"
+          echo "Memory    : $(free -h | awk '/Mem:/ {print $2}')"
+          echo "Disk      : $(df -h / | awk 'NR==2 {print $2}')"
+          echo "Hostname  : $(hostname)"
+          echo "=================================="
+
+      - name: Checkout APK repository with Git LFS
+        uses: actions/checkout@v4
+        with:
+          repository: skyro777/3A-UpdateStop
+          ref: main
+          path: apk-repo
+          lfs: true
+
+      - name: Verify APK, checksum and DEX layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUTPUT_DIR/reports" "$OUTPUT_DIR/original-dex"
+
+          if [ ! -f "$APK_PATH" ]; then
+            echo "::error::APK not found at: $APK_PATH"
+            exit 1
+          fi
+
+          if head -n 1 "$APK_PATH" | grep -qF 'version https://git-lfs.github.com/spec/v1'; then
+            echo "::error::Git LFS pointer found instead of the APK binary."
+            exit 1
+          fi
+
+          ACTUAL_SHA256="$(sha256sum "$APK_PATH" | awk '{print $1}')"
+          echo "APK SHA-256: $ACTUAL_SHA256"
+
+          if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+            echo "::error::APK checksum differs from the inspected APK. Re-run reconnaissance before using this workflow."
+            echo "Expected: $EXPECTED_SHA256"
+            echo "Actual:   $ACTUAL_SHA256"
+            exit 1
+          fi
+
+          DEX_COUNT="$(unzip -Z1 "$APK_PATH" | grep -Ec '^classes([0-9]+)?\.dex$' || true)"
+          echo "DEX files found: $DEX_COUNT"
+
+          if [ "$DEX_COUNT" -ne 10 ]; then
+            echo "::error::Expected 10 DEX files from reconnaissance, found $DEX_COUNT."
+            exit 1
+          fi
+
+          unzip -tq "$APK_PATH" >/dev/null
+          unzip -j "$APK_PATH" 'classes*.dex' -d "$OUTPUT_DIR/original-dex" >/dev/null
+
+          {
+            echo "APK: $APK_PATH"
+            echo "Package: com.sayx.sagame"
+            echo "Version: 2.7.32 (version code 160749)"
+            echo "APK size bytes: $(stat -c '%s' "$APK_PATH")"
+            echo "SHA-256: $ACTUAL_SHA256"
+            echo "DEX count: $DEX_COUNT"
+            echo "ZIP integrity: passed"
+          } | tee "$OUTPUT_DIR/reports/input-verification.txt"
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Download JADX
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 2 \
+            -o jadx.zip \
+            "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip"
+          unzip -q jadx.zip -d jadx
+          chmod +x jadx/bin/jadx
+          ./jadx/bin/jadx --version | tee "$OUTPUT_DIR/reports/jadx-version.txt"
+
+      - name: Download Apktool
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APKTOOL_URL="https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar"
+          curl -fL --retry 3 --retry-delay 2 -o apktool.jar "$APKTOOL_URL"
+
+          # Verify the official Apktool 3.0.3 release artifact.
+          echo "dbf930b076c6b9be08d57c449cacefc3bdd6b71ebd59b3066fc0e1f5b14f9423  apktool.jar" | sha256sum -c -
+          java -jar apktool.jar --version | tee "$OUTPUT_DIR/reports/apktool-version.txt"
+
+      - name: Decompile DEX to Java with JADX
+        shell: bash
+        env:
+          JAVA_OPTS: "-Xms512m -Xmx8g -XX:+UseG1GC -XX:MaxGCPauseMillis=250"
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUTPUT_DIR/jadx-java"
+
+          THREADS="$(nproc)"
+          if [ "$THREADS" -gt 6 ]; then THREADS=6; fi
+          echo "JADX threads: $THREADS"
+          echo "JADX mode: auto"
+          echo "Kotlin lambda inlining: disabled (less aggressive reconstruction)"
+
+          set +e
+          ./jadx/bin/jadx \
+            -d "$OUTPUT_DIR/jadx-java" \
+            --no-res \
+            --threads-count "$THREADS" \
+            --show-bad-code \
+            --deobf \
+            --use-source-name-as-class-name-alias if-better \
+            --decompilation-mode auto \
+            --no-inline-kotlin-lambda \
+            --comments-level debug \
+            --log-level INFO \
+            "$APK_PATH" 2>&1 | tee "$OUTPUT_DIR/reports/jadx.log" | tail -n 100
+          JADX_EXIT="${PIPESTATUS[0]}"
+          set -e
+
+          JAVA_COUNT="$(find "$OUTPUT_DIR/jadx-java" -type f -name '*.java' | wc -l)"
+          ERROR_LINES="$(grep -c '^ERROR -' "$OUTPUT_DIR/reports/jadx.log" || true)"
+          METHOD_ERRORS="$(grep -c '^ERROR -   Method:' "$OUTPUT_DIR/reports/jadx.log" || true)"
+
+          {
+            echo "JADX exit code: $JADX_EXIT"
+            echo "Java files generated: $JAVA_COUNT"
+            echo "Error log lines: $ERROR_LINES"
+            echo "Failed method entries: $METHOD_ERRORS"
+          } | tee "$OUTPUT_DIR/reports/jadx-summary.txt"
+
+          echo "$JADX_EXIT" > "$OUTPUT_DIR/reports/jadx-exit-code.txt"
+
+          if [ "$JADX_EXIT" -ne 0 ]; then
+            echo "::warning::JADX reported decompilation errors. Its generated Java files and log will still be retained."
+          fi
+
+      - name: Decode APK to smali, manifest, resources and assets with Apktool
+        shell: bash
+        env:
+          JAVA_TOOL_OPTIONS: "-Xms512m -Xmx6g -XX:+UseG1GC"
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUTPUT_DIR/apktool"
+
+          set +e
+          java -jar apktool.jar d \
+            -f \
+            -o "$OUTPUT_DIR/apktool" \
+            "$APK_PATH" 2>&1 | tee "$OUTPUT_DIR/reports/apktool.log" | tail -n 100
+          APKTOOL_EXIT="${PIPESTATUS[0]}"
+          set -e
+
+          SMALI_COUNT="$(find "$OUTPUT_DIR/apktool" -type f -name '*.smali' 2>/dev/null | wc -l)"
+          RESOURCE_COUNT="$(find "$OUTPUT_DIR/apktool/res" -type f 2>/dev/null | wc -l)"
+
+          {
+            echo "Apktool exit code: $APKTOOL_EXIT"
+            echo "Smali files generated: $SMALI_COUNT"
+            echo "Decoded resource files: $RESOURCE_COUNT"
+          } | tee "$OUTPUT_DIR/reports/apktool-summary.txt"
+
+          echo "$APKTOOL_EXIT" > "$OUTPUT_DIR/reports/apktool-exit-code.txt"
+
+          if [ "$APKTOOL_EXIT" -ne 0 ]; then
+            echo "::warning::Apktool reported decode errors. Any partial smali/resources will be retained."
+          fi
+
+      - name: Decompile embedded JAR libraries with JADX
+        if: always()
+        shell: bash
+        env:
+          JAVA_OPTS: "-Xms256m -Xmx4g -XX:+UseG1GC"
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUTPUT_DIR/embedded-jars"
+          LOG="$OUTPUT_DIR/reports/embedded-jars.log"
+          touch "$LOG"
+          JAR_COUNT=0
+          JAR_FAILURES=0
+
+          if [ -d "$OUTPUT_DIR/apktool/assets" ]; then
+            while IFS= read -r -d '' JAR_FILE; do
+              JAR_COUNT=$((JAR_COUNT + 1))
+              RELATIVE_PATH="${JAR_FILE#"$OUTPUT_DIR/apktool/assets/"}"
+              SAFE_NAME="${RELATIVE_PATH//\//__}"
+              SAFE_NAME="${SAFE_NAME// /_}"
+              SAFE_NAME="${SAFE_NAME%.jar}"
+              DEST="$OUTPUT_DIR/embedded-jars/$SAFE_NAME"
+              mkdir -p "$DEST"
+
+              echo "===== $RELATIVE_PATH =====" | tee -a "$LOG"
+              set +e
+              ./jadx/bin/jadx \
+                -d "$DEST" \
+                --no-res \
+                --threads-count 2 \
+                --decompilation-mode auto \
+                --show-bad-code \
+                "$JAR_FILE" >> "$LOG" 2>&1
+              JAR_EXIT=$?
+              set -e
+
+              echo "Exit code: $JAR_EXIT" | tee -a "$LOG"
+              if [ "$JAR_EXIT" -ne 0 ]; then
+                JAR_FAILURES=$((JAR_FAILURES + 1))
+              fi
+            done < <(find "$OUTPUT_DIR/apktool/assets" -type f -iname '*.jar' -print0)
+          fi
+
+          {
+            echo "Embedded JARs found: $JAR_COUNT"
+            echo "JAR decompilation failures: $JAR_FAILURES"
+          } | tee "$OUTPUT_DIR/reports/embedded-jars-summary.txt"
+
+      - name: Inspect Flutter payload and native libraries
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPORT="$OUTPUT_DIR/reports/native-and-flutter-inventory.txt"
+          APKTOOL_DIR="$OUTPUT_DIR/apktool"
+
+          {
+            echo "APK native / Flutter inventory"
+            echo "==============================="
+            echo "Native library count: $(find "$APKTOOL_DIR/lib" -type f -name '*.so' 2>/dev/null | wc -l)"
+            echo "Flutter assets file count: $(find "$APKTOOL_DIR/assets/flutter_assets" -type f 2>/dev/null | wc -l)"
+            echo
+            echo "Native libraries:"
+            find "$APKTOOL_DIR/lib" -type f -name '*.so' -printf '%p (%s bytes)\n' 2>/dev/null | sort || true
+            echo
+            echo "Flutter key files:"
+            for FILE in \
+              "$APKTOOL_DIR/lib/arm64-v8a/libapp.so" \
+              "$APKTOOL_DIR/lib/arm64-v8a/libflutter.so"; do
+              if [ -f "$FILE" ]; then
+                file "$FILE"
+                if command -v readelf >/dev/null 2>&1; then
+                  readelf -h "$FILE" | grep -E 'Class:|Data:|Type:|Machine:' || true
+                fi
+                echo
+              fi
+            done
+          } | tee "$REPORT"
+
+          if [ -f "$APKTOOL_DIR/lib/arm64-v8a/libapp.so" ]; then
+            strings -a "$APKTOOL_DIR/lib/arm64-v8a/libapp.so" \
+              > "$OUTPUT_DIR/reports/flutter-libapp-strings.txt" || true
+          fi
+
+      - name: Write APK-specific decompilation notes
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$OUTPUT_DIR/reports"
+          cat > "$OUTPUT_DIR/README-RESULTS.md" <<'EOF'
+          # 3A Cloud Gaming APK - Decompilation Output
+
+          ## APK identified during reconnaissance
+          - Package: `com.sayx.sagame`
+          - Version: `2.7.32` (version code `160749`)
+          - Minimum SDK: `24`
+          - Target SDK: `36`
+          - DEX files: `10` (DEX version `037`)
+          - Approximate defined classes reported by reconnaissance: `83,107`
+          - Native libraries: `49`, reported under `arm64-v8a`
+          - Flutter indicators: `libflutter.so`, `libapp.so`, and `assets/flutter_assets/`
+          - Kotlin and Kotlin coroutine indicators were also detected.
+          - Reconnaissance estimated that 32.7% of parsed class names have 1-2 character simple names; this is only a heuristic, not a definitive obfuscation measurement.
+
+          ## Output folders
+          - `jadx-java/`: JADX reconstructed Java source. Some methods may remain incomplete or produce errors.
+          - `apktool/`: Apktool decoded manifest/resources/assets and smali output for the DEX files.
+          - `original-dex/`: original DEX binaries copied from the inspected APK.
+          - `embedded-jars/`: separate JADX attempts for JAR libraries found under APK assets.
+          - `reports/`: tool logs, exit codes, counts, Flutter/native inventory, and verification details.
+
+          ## Important interpretation
+          JADX Java output is a reconstruction, not the original source code. Apktool smali is the lower-level fallback for classes/methods that JADX cannot reconstruct as Java.
+
+          This APK includes a Flutter native payload (`libapp.so`) and Flutter assets. The workflow preserves these files and records ELF/strings information, but it does not convert Flutter AOT machine code into original Dart source. Native `.so` libraries likewise remain binaries in this archive.
+
+          No APK code is executed by this workflow.
+          EOF
+
+      - name: Create and verify complete output ZIP
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUTPUT_DIR/reports"
+
+          JAVA_COUNT="$(find "$OUTPUT_DIR/jadx-java" -type f -name '*.java' 2>/dev/null | wc -l)"
+          SMALI_COUNT="$(find "$OUTPUT_DIR/apktool" -type f -name '*.smali' 2>/dev/null | wc -l)"
+
+          {
+            echo "Java source files: $JAVA_COUNT"
+            echo "Smali files: $SMALI_COUNT"
+            echo "Original DEX files: $(find "$OUTPUT_DIR/original-dex" -type f -name '*.dex' 2>/dev/null | wc -l)"
+          } | tee "$OUTPUT_DIR/reports/final-file-counts.txt"
+
+          if [ "$JAVA_COUNT" -eq 0 ] && [ "$SMALI_COUNT" -eq 0 ]; then
+            echo "::error::Neither JADX Java nor Apktool smali output was generated. Logs and original DEX files will still be packaged."
+          fi
+
+          zip -qr 3a-cloud-gaming-update-full-decompiled.zip "$OUTPUT_DIR"
+          unzip -tq 3a-cloud-gaming-update-full-decompiled.zip >/dev/null
+          ls -lh 3a-cloud-gaming-update-full-decompiled.zip
+
+          if [ "$JAVA_COUNT" -eq 0 ] && [ "$SMALI_COUNT" -eq 0 ]; then
+            exit 1
+          fi
+
+      - name: Upload complete decompilation and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 3a-cloud-gaming-update-full-decompiled
+          path: 3a-cloud-gaming-update-full-decompiled.zip
+          retention-days: 14
+          if-no-files-found: warn
