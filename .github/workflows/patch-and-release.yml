@@ -14,7 +14,7 @@ jobs:
     env:
       APK_PATH: "apk-repo/3A CLOUD GAMING UPDATE.apk"
       EXPECTED_SHA256: "e06059bfd2238173f118ad1f54902ba45ef92031d5101b61b45d2486fb0955cb"
-      KEYSTORE: "ci/3amod.keystore"
+      KEYSTORE: "apk-repo/ci/3amod.keystore"
       KS_PASS: "3AUpdateStop!2025"
       KS_ALIAS: "3amod"
       OUT_APK: "3A-CLOUD-GAMING-2.7.32-NOUPDATE.apk"
