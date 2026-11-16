@@ -13,7 +13,7 @@ jobs:
 
     env:
       APK_PATH: "apk-repo/3A CLOUD GAMING UPDATE.apk"
-      EXPECTED_SHA256: "e06059bfd2238173f118f1f54902ba45ef92031d5101b61b45d2486fb0955cb"
+      EXPECTED_SHA256: "e06059bfd2238173f118ad1f54902ba45ef92031d5101b61b45d2486fb0955cb"
       KEYSTORE: "apk-repo/ci/3amod.keystore"
       KS_PASS: "3AUpdateStop!2025"
       KS_ALIAS: "3amod"
